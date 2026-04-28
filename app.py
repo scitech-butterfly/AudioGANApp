@@ -98,13 +98,17 @@ def compute_stft(audio: np.ndarray):
 
 
 def magnitude_to_mel(magnitude: np.ndarray) -> np.ndarray:
-    mel_fb = librosa.filters.mel(sr=SAMPLE_RATE, n_fft=N_FFT, n_mels=N_MELS)
-    power = magnitude ** 2
-    mel = np.dot(mel_fb, power)
-    mel = np.maximum(mel, 1e-10)
+    # Use librosa's built-in to ensure alignment with the generator's training
+    mel = librosa.feature.melspectrogram(
+        S=magnitude**2, 
+        sr=SAMPLE_RATE, 
+        n_fft=N_FFT, 
+        hop_length=HOP_LENGTH, 
+        n_mels=N_MELS
+    )
+    # The real-time engine uses np.max as the reference point for DB conversion
     log_mel = librosa.power_to_db(mel, ref=np.max)
     return log_mel
-
 
 def normalize_mel(log_mel: np.ndarray) -> np.ndarray:
     return (log_mel + 40.0) / 40.0
@@ -136,7 +140,7 @@ def enhance_mel_chunked(norm_mel):
         # 🔥 PAD LAST CHUNK
         if chunk.shape[1] < CHUNK_FRAMES:
             pad_width = CHUNK_FRAMES - chunk.shape[1]
-            chunk = np.pad(chunk, ((0, 0), (0, pad_width)))
+            chunk = np.pad(chunk, ((0, 0), (0, pad_width)), mode='reflect')
 
         tensor = torch.tensor(chunk).unsqueeze(0).unsqueeze(0).float().to(DEVICE)
 
@@ -260,7 +264,6 @@ def match_loudness(enhanced, original):
 
 @app.route("/enhance", methods=["POST"])
 def enhance():
-    print("🔥 /enhance HIT")
     if "audio" not in request.files:
         return jsonify({"error": "No audio file provided"}), 400
 
@@ -268,129 +271,91 @@ def enhance():
     raw_bytes = file.read()
     if not raw_bytes:
         return jsonify({"error": "Empty audio file"}), 400
-    print("1. audio received")
-    
+
     try:
-        # 1. Decode webm → wav
+        # 1. Decode webm → wav (Consistent with app.py processing)
         noisy_audio = webm_to_wav(raw_bytes)
 
         if len(noisy_audio) < 512:
             return jsonify({"error": "Audio too short; record at least 0.5 seconds"}), 400
 
         # 2. STFT decomposition
-        _, orig_mag, phase = compute_stft(noisy_audio)
+        # Match the N_FFT and HOP_LENGTH used in the realtime engine
+        stft = librosa.stft(noisy_audio, n_fft=N_FFT, hop_length=HOP_LENGTH)
+        mag = np.abs(stft)
+        phase = np.angle(stft)
 
-        # 3. Mel spectrogram + normalize
-        log_mel = magnitude_to_mel(orig_mag)
-        norm_mel = normalize_mel(log_mel)
+        # 3. Mel spectrogram calculation
+        # We use the specific parameters from the realtime engine for consistency
+        mel = librosa.feature.melspectrogram(
+            S=mag**2,
+            sr=SAMPLE_RATE,
+            n_fft=N_FFT,
+            hop_length=HOP_LENGTH,
+            n_mels=N_MELS
+        )
 
-        # 4. GAN inference (windowed)
+        # 4. Critical Normalization Fix
+        # Use ref=np.max to match the realtime engine's distribution
+        log_mel = librosa.power_to_db(mel, ref=np.max)
+        norm_mel = (log_mel + 40.0) / 40.0
+
+        # 5. GAN inference (windowed/chunked)
         enhanced_norm_mel = enhance_mel_chunked(norm_mel)
 
-        # 5. Denormalize → power
-        enhanced_log_mel = denormalize_mel(enhanced_norm_mel)
-        enhanced_power = mel_to_power(enhanced_log_mel)
+        # 6. Denormalize → power
+        enhanced_log_mel = enhanced_norm_mel * 40.0 - 40.0
+        enhanced_power = librosa.db_to_power(enhanced_log_mel)
 
-        # 6. Mel → STFT magnitude (IMPORTANT: original working method)
-        enhanced_mag = librosa.feature.inverse.mel_to_stft(
+        # 7. Mel → STFT magnitude (Inverse Mel)
+        # Align frames to the original magnitude
+        enh_stft_mag = librosa.feature.inverse.mel_to_stft(
             enhanced_power,
             sr=SAMPLE_RATE,
             n_fft=N_FFT,
             power=2.0
         )
+        enh_stft_mag = enh_stft_mag[:, :mag.shape[1]]
 
-        # 7. Align dimensions
-        T = min(enhanced_mag.shape[1], orig_mag.shape[1])
-        enhanced_mag = enhanced_mag[:, :T]
-        orig_mag_t = orig_mag[:, :T]
-        phase_t = phase[:, :T]
+        # 8. Precise Masking Logic (from realtime_engine.py)
+        # Removed the nn_filter smoothing which was blurring the results
+        mask = enh_stft_mag / (mag + 1e-8)
+        mask = np.clip(mask, 0.0, 2.0) # Stability clamp
 
-        # 8. Masking (original correct approach)
-        mask = enhanced_mag / (orig_mag_t + 1e-8)
-
-        # Difference instead of ratio
-        # diff = enhanced_mag - orig_mag_t
-
-        # Convert to mask
-        # mask = 1.0 + (diff / (np.max(np.abs(orig_mag_t)) + 1e-8))
-
-        # Clamp safely
-        mask = mask * 1.3
-        # mask = librosa.decompose.nn_filter(mask, aggregate=np.median, width=7)
-        mask = np.clip(mask, 0.0, 1.9)
-
-
-        # Normalize energy
-        # energy = orig_mag_t / (np.max(orig_mag_t) + 1e-8)
-
-        # 🎯 Blend ratio with identity (this is the key)
-        # mask = ratio * 0.7 + 0.3
-
-        # mask = np.clip(mask, 0.0, 1.9)
-
-        final_mag = orig_mag_t * mask
+        # Apply mask to original magnitude
+        final_mag = mag * mask
 
         # 9. Reconstruct waveform
-        enhanced_stft = final_mag * np.exp(1j * phase_t)
+        enhanced_stft = final_mag * np.exp(1j * phase)
         enhanced_audio = librosa.istft(
             enhanced_stft,
             hop_length=HOP_LENGTH,
-            n_fft=N_FFT
+            n_fft=N_FFT,
+            length=len(noisy_audio)
         )
 
-        # 🔊 10. Loudness matching (KEY FIX)
-        def match_loudness(enhanced, original):
-            rms_enh = np.sqrt(np.mean(enhanced**2) + 1e-8)
-            rms_orig = np.sqrt(np.mean(original**2) + 1e-8)
-
-            if rms_enh < 1e-6:
-                return enhanced
-
-            gain = rms_orig / rms_enh
-
-            # allow stronger boost (important)
-            gain = np.clip(gain, 1.0, 5.0)
-
-            enhanced = enhanced * gain
-            return np.clip(enhanced, -1.0, 1.0)
-
-        enhanced_audio = match_loudness(enhanced_audio, noisy_audio)
-
-        # 🔥 Final peak normalization
+        # 10. Normalization and peak safety
+        # Match the peak normalization style of the realtime engine
         peak = np.max(np.abs(enhanced_audio))
-        if peak > 0:
-            enhanced_audio = enhanced_audio / peak * 0.98
+        if peak > 1.0:
+            enhanced_audio /= peak
 
         enhanced_audio = enhanced_audio.astype(np.float32)
 
-        # 11. Metrics
+        # 11. Metrics calculation
         min_len = min(len(noisy_audio), len(enhanced_audio))
-
         snr = compute_snr(noisy_audio[:min_len], enhanced_audio[:min_len])
+        pesq_score = compute_pesq_safe(noisy_audio[:min_len], enhanced_audio[:min_len], SAMPLE_RATE)
+        stoi_score = compute_stoi_safe(noisy_audio[:min_len], enhanced_audio[:min_len], SAMPLE_RATE)
 
-        pesq_score = compute_pesq_safe(
-            noisy_audio[:min_len],
-            enhanced_audio[:min_len],
-            SAMPLE_RATE
-        )
-
-        stoi_score = compute_stoi_safe(
-            noisy_audio[:min_len],
-            enhanced_audio[:min_len],
-            SAMPLE_RATE
-        )
-
-        # 12. Spectrogram data
-        orig_spec = spec_to_list(orig_mag)
+        # 12. Spectrogram data for UI
+        orig_spec = spec_to_list(mag)
         enh_spec = spec_to_list(final_mag)
 
-        # 13. Encode audio
-        noisy_b64 = audio_to_wav_b64(noisy_audio)
-        enhanced_b64 = audio_to_wav_b64(enhanced_audio)
-
+        # 13. Encode audio for response
         return jsonify({
-            "enhanced_audio": enhanced_b64,
-            "noisy_audio": noisy_b64,
+            "enhanced_audio": audio_to_wav_b64(enhanced_audio),
+            "noisy_audio": audio_to_wav_b64(noisy_audio),
             "metrics": {
                 "pesq_enhanced": round(pesq_score, 3),
                 "stoi_enhanced": round(stoi_score, 3),
@@ -402,9 +367,6 @@ def enhance():
             },
         })
 
-    except FileNotFoundError as exc:
-        logger.error("FFmpeg not found: %s", exc)
-        return jsonify({"error": "FFmpeg is not installed on the server."}), 500
     except Exception as exc:
         logger.exception("Enhancement failed")
         return jsonify({"error": str(exc)}), 500
