@@ -1,6 +1,6 @@
 /* ── AudioGAN Voice Enhancer – script.js ─────────────────────────────────── */
 
-const API_URL = 'http://localhost:5000/enhance';
+const API_URL = '/enhance';
 
 // ── DOM refs ──────────────────────────────────────────────────────────────
 const recordBtn      = document.getElementById('recordBtn');
