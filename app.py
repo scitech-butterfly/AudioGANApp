@@ -126,38 +126,43 @@ OVERLAP = 64
 
 def enhance_mel_chunked(norm_mel):
     n_mels, T = norm_mel.shape
-
     output = np.zeros((n_mels, T))
     weight = np.zeros((n_mels, T))
-
     step = CHUNK_FRAMES - OVERLAP
 
     for start in range(0, T, step):
         end = start + CHUNK_FRAMES
-
         chunk = norm_mel[:, start:end]
 
-        # 🔥 PAD LAST CHUNK
         if chunk.shape[1] < CHUNK_FRAMES:
             pad_width = CHUNK_FRAMES - chunk.shape[1]
             chunk = np.pad(chunk, ((0, 0), (0, pad_width)), mode='reflect')
+
+        # --- KEY FIX: RE-NORMALIZE THIS SPECIFIC CHUNK ---
+        # This forces the chunk to look exactly like a real-time 16kHz buffer
+        chunk_min = chunk.min()
+        chunk_max = chunk.max()
+        if (chunk_max - chunk_min) > 1e-5:
+            chunk = (chunk - chunk_min) / (chunk_max - chunk_min)
+        # -------------------------------------------------
 
         tensor = torch.tensor(chunk).unsqueeze(0).unsqueeze(0).float().to(DEVICE)
 
         with torch.no_grad():
             out = generator(tensor)
-
+        
         out = out.squeeze().cpu().numpy()
 
-        # 🔥 TRIM BACK
-        out = out[:, :min(CHUNK_FRAMES, T - start)]
+        # Reverse the local normalization to keep volume consistent
+        if (chunk_max - chunk_min) > 1e-5:
+            out = out * (chunk_max - chunk_min) + chunk_min
 
+        out = out[:, :min(CHUNK_FRAMES, T - start)]
         output[:, start:start + out.shape[1]] += out
         weight[:, start:start + out.shape[1]] += 1
 
     weight[weight == 0] = 1
     return output / weight
-
 
 # ── GAN inference (windowed) ───────────────────────────────────────────────────
 
