@@ -38,6 +38,10 @@ def load_model():
     if os.path.exists(CHECKPOINT):
         try:
             ckpt = torch.load(CHECKPOINT, map_location=DEVICE)
+            if not os.path.exists(ckpt):
+                print("⬇️ Downloading model checkpoint...")
+                url = "https://drive.google.com/uc?id=1QPis6ClkVxvyNzQg2TkS1z523kstdGSi"   # <-- replace this
+                gdown.download(url, ckpt, quiet=False)
             state = ckpt.get("generator", ckpt.get("state_dict", ckpt))
             generator.load_state_dict(state, strict=True)
             logger.info("Checkpoint loaded from %s", CHECKPOINT)
