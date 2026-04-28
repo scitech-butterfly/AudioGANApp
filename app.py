@@ -260,6 +260,7 @@ def match_loudness(enhanced, original):
 
 @app.route("/enhance", methods=["POST"])
 def enhance():
+    print("🔥 /enhance HIT")
     if "audio" not in request.files:
         return jsonify({"error": "No audio file provided"}), 400
 
@@ -267,7 +268,8 @@ def enhance():
     raw_bytes = file.read()
     if not raw_bytes:
         return jsonify({"error": "Empty audio file"}), 400
-
+    print("1. audio received")
+    
     try:
         # 1. Decode webm → wav
         noisy_audio = webm_to_wav(raw_bytes)
@@ -313,8 +315,8 @@ def enhance():
         # mask = 1.0 + (diff / (np.max(np.abs(orig_mag_t)) + 1e-8))
 
         # Clamp safely
-        mask = mask * 1.4
-        mask = librosa.decompose.nn_filter(mask, aggregate=np.median, width=7)
+        mask = mask * 1.3
+        # mask = librosa.decompose.nn_filter(mask, aggregate=np.median, width=7)
         mask = np.clip(mask, 0.0, 1.9)
 
 
