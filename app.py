@@ -8,7 +8,6 @@ import logging
 import numpy as np
 import librosa
 import soundfile as sf
-import torch
 import noisereduce as nr
 import scipy.signal
 
@@ -26,7 +25,7 @@ SAMPLE_RATE = 16000
 N_FFT = 512
 HOP_LENGTH = 128
 N_MELS = 80
-WINDOW_FRAMES = 128          # mel time-frames per GAN window
+WINDOW_FRAMES = 128         # mel time-frames per GAN window
 CHECKPOINT = "checkpoints/G_final.pt"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -333,5 +332,4 @@ def enhance():
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
-    load_model()
     app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
