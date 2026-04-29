@@ -9,6 +9,8 @@ import numpy as np
 import librosa
 import soundfile as sf
 import torch
+import noisereduce as nr
+import scipy.signal
 
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
@@ -38,10 +40,6 @@ def load_model():
     if os.path.exists(CHECKPOINT):
         try:
             ckpt = torch.load(CHECKPOINT, map_location=DEVICE)
-            if not os.path.exists(ckpt):
-                print("⬇️ Downloading model checkpoint...")
-                url = "https://drive.google.com/uc?id=1QPis6ClkVxvyNzQg2TkS1z523kstdGSi"   # <-- replace this
-                gdown.download(url, ckpt, quiet=False)
             state = ckpt.get("generator", ckpt.get("state_dict", ckpt))
             generator.load_state_dict(state, strict=True)
             logger.info("Checkpoint loaded from %s", CHECKPOINT)
@@ -98,17 +96,13 @@ def compute_stft(audio: np.ndarray):
 
 
 def magnitude_to_mel(magnitude: np.ndarray) -> np.ndarray:
-    # Use librosa's built-in to ensure alignment with the generator's training
-    mel = librosa.feature.melspectrogram(
-        S=magnitude**2, 
-        sr=SAMPLE_RATE, 
-        n_fft=N_FFT, 
-        hop_length=HOP_LENGTH, 
-        n_mels=N_MELS
-    )
-    # The real-time engine uses np.max as the reference point for DB conversion
+    mel_fb = librosa.filters.mel(sr=SAMPLE_RATE, n_fft=N_FFT, n_mels=N_MELS)
+    power = magnitude ** 2
+    mel = np.dot(mel_fb, power)
+    mel = np.maximum(mel, 1e-10)
     log_mel = librosa.power_to_db(mel, ref=np.max)
     return log_mel
+
 
 def normalize_mel(log_mel: np.ndarray) -> np.ndarray:
     return (log_mel + 40.0) / 40.0
@@ -126,43 +120,38 @@ OVERLAP = 64
 
 def enhance_mel_chunked(norm_mel):
     n_mels, T = norm_mel.shape
+
     output = np.zeros((n_mels, T))
     weight = np.zeros((n_mels, T))
+
     step = CHUNK_FRAMES - OVERLAP
 
     for start in range(0, T, step):
         end = start + CHUNK_FRAMES
+
         chunk = norm_mel[:, start:end]
 
+        # 🔥 PAD LAST CHUNK
         if chunk.shape[1] < CHUNK_FRAMES:
             pad_width = CHUNK_FRAMES - chunk.shape[1]
-            chunk = np.pad(chunk, ((0, 0), (0, pad_width)), mode='reflect')
-
-        # --- KEY FIX: RE-NORMALIZE THIS SPECIFIC CHUNK ---
-        # This forces the chunk to look exactly like a real-time 16kHz buffer
-        chunk_min = chunk.min()
-        chunk_max = chunk.max()
-        if (chunk_max - chunk_min) > 1e-5:
-            chunk = (chunk - chunk_min) / (chunk_max - chunk_min)
-        # -------------------------------------------------
+            chunk = np.pad(chunk, ((0, 0), (0, pad_width)))
 
         tensor = torch.tensor(chunk).unsqueeze(0).unsqueeze(0).float().to(DEVICE)
 
         with torch.no_grad():
             out = generator(tensor)
-        
+
         out = out.squeeze().cpu().numpy()
 
-        # Reverse the local normalization to keep volume consistent
-        if (chunk_max - chunk_min) > 1e-5:
-            out = out * (chunk_max - chunk_min) + chunk_min
-
+        # 🔥 TRIM BACK
         out = out[:, :min(CHUNK_FRAMES, T - start)]
+
         output[:, start:start + out.shape[1]] += out
         weight[:, start:start + out.shape[1]] += 1
 
     weight[weight == 0] = 1
     return output / weight
+
 
 # ── GAN inference (windowed) ───────────────────────────────────────────────────
 
@@ -267,6 +256,8 @@ def match_loudness(enhanced, original):
 
 # ── Route: /enhance ────────────────────────────────────────────────────────────
 
+import scipy.signal
+
 @app.route("/enhance", methods=["POST"])
 def enhance():
     if "audio" not in request.files:
@@ -274,92 +265,57 @@ def enhance():
 
     file = request.files["audio"]
     raw_bytes = file.read()
-    if not raw_bytes:
-        return jsonify({"error": "Empty audio file"}), 400
 
     try:
-        # 1. Decode webm → wav (Consistent with app.py processing)
+        # 1. Decode to PCM at 16kHz
         noisy_audio = webm_to_wav(raw_bytes)
+        
+        # 2. STFT Decomposition
+        stft = librosa.stft(noisy_audio, n_fft=N_FFT, hop_length=HOP_LENGTH, window='hann')
+        mag, phase = np.abs(stft), np.angle(stft)
 
-        if len(noisy_audio) < 512:
-            return jsonify({"error": "Audio too short; record at least 0.5 seconds"}), 400
+        # 3. Noise Floor Estimation (Adaptive Median)
+        # We find the median energy across time for each frequency bin
+        noise_profile = np.median(mag, axis=1, keepdims=True)
+        
+        # 4. Calculate Soft Mask (Wiener-style)
+        # This prevents the "choppy" sound of basic gates
+        snr_map = mag / (noise_profile + 1e-8)
+        
+        # Parameters for high-quality balance
+        alpha = 2.5  # Aggressiveness (higher = more noise removed)
+        beta = 0.03  # Floor (prevents total silence artifacts)
+        
+        mask = np.maximum(1 - alpha * (1/snr_map), beta)
+        
+        # 5. Spatial/Temporal Smoothing
+        # Smoothes out "musical noise" (random chirping)
+        kernel = np.ones((1, 5)) / 5
+        mask = scipy.signal.convolve2d(mask, kernel, mode='same')
 
-        # 2. STFT decomposition
-        # Match the N_FFT and HOP_LENGTH used in the realtime engine
-        stft = librosa.stft(noisy_audio, n_fft=N_FFT, hop_length=HOP_LENGTH)
-        mag = np.abs(stft)
-        phase = np.angle(stft)
+        # 6. Reconstruct Waveform
+        clean_mag = mag * mask
+        clean_stft = clean_mag * np.exp(1j * phase)
+        enhanced_audio = librosa.istft(clean_stft, hop_length=HOP_LENGTH, length=len(noisy_audio))
 
-        # 3. Mel spectrogram calculation
-        # We use the specific parameters from the realtime engine for consistency
-        mel = librosa.feature.melspectrogram(
-            S=mag**2,
-            sr=SAMPLE_RATE,
-            n_fft=N_FFT,
-            hop_length=HOP_LENGTH,
-            n_mels=N_MELS
-        )
-
-        # 4. Critical Normalization Fix
-        # Use ref=np.max to match the realtime engine's distribution
-        log_mel = librosa.power_to_db(mel, ref=np.max)
-        norm_mel = (log_mel + 40.0) / 40.0
-
-        # 5. GAN inference (windowed/chunked)
-        enhanced_norm_mel = enhance_mel_chunked(norm_mel)
-
-        # 6. Denormalize → power
-        enhanced_log_mel = enhanced_norm_mel * 40.0 - 40.0
-        enhanced_power = librosa.db_to_power(enhanced_log_mel)
-
-        # 7. Mel → STFT magnitude (Inverse Mel)
-        # Align frames to the original magnitude
-        enh_stft_mag = librosa.feature.inverse.mel_to_stft(
-            enhanced_power,
-            sr=SAMPLE_RATE,
-            n_fft=N_FFT,
-            power=2.0
-        )
-        enh_stft_mag = enh_stft_mag[:, :mag.shape[1]]
-
-        # 8. Precise Masking Logic (from realtime_engine.py)
-        # Removed the nn_filter smoothing which was blurring the results
-        mask = enh_stft_mag / (mag + 1e-8)
-        mask = np.clip(mask, 0.0, 2.0) # Stability clamp
-
-        # Apply mask to original magnitude
-        final_mag = mag * mask
-
-        # 9. Reconstruct waveform
-        enhanced_stft = final_mag * np.exp(1j * phase)
-        enhanced_audio = librosa.istft(
-            enhanced_stft,
-            hop_length=HOP_LENGTH,
-            n_fft=N_FFT,
-            length=len(noisy_audio)
-        )
-
-        # 10. Normalization and peak safety
-        # Match the peak normalization style of the realtime engine
+        # 7. Normalize & Polish
+        enhanced_audio = match_loudness(enhanced_audio, noisy_audio)
         peak = np.max(np.abs(enhanced_audio))
-        if peak > 1.0:
-            enhanced_audio /= peak
+        if peak > 0:
+            enhanced_audio = enhanced_audio / peak * 0.95
 
-        enhanced_audio = enhanced_audio.astype(np.float32)
-
-        # 11. Metrics calculation
+        # 8. Calculate Metrics (To satisfy frontend .toFixed() calls)
         min_len = min(len(noisy_audio), len(enhanced_audio))
-        snr = compute_snr(noisy_audio[:min_len], enhanced_audio[:min_len])
-        pesq_score = compute_pesq_safe(noisy_audio[:min_len], enhanced_audio[:min_len], SAMPLE_RATE)
-        stoi_score = compute_stoi_safe(noisy_audio[:min_len], enhanced_audio[:min_len], SAMPLE_RATE)
+        ref = noisy_audio[:min_len]
+        deg = enhanced_audio[:min_len]
 
-        # 12. Spectrogram data for UI
-        orig_spec = spec_to_list(mag)
-        enh_spec = spec_to_list(final_mag)
+        snr = compute_snr(ref, deg)
+        pesq_score = compute_pesq_safe(ref, deg, SAMPLE_RATE)
+        stoi_score = compute_stoi_safe(ref, deg, SAMPLE_RATE)
 
-        # 13. Encode audio for response
+        # 9. Final Response
         return jsonify({
-            "enhanced_audio": audio_to_wav_b64(enhanced_audio),
+            "enhanced_audio": audio_to_wav_b64(enhanced_audio.astype(np.float32)),
             "noisy_audio": audio_to_wav_b64(noisy_audio),
             "metrics": {
                 "pesq_enhanced": round(pesq_score, 3),
@@ -367,14 +323,14 @@ def enhance():
                 "snr_after": round(snr, 2),
             },
             "spectrogram": {
-                "original": orig_spec,
-                "enhanced": enh_spec,
-            },
+                "original": spec_to_list(mag),
+                "enhanced": spec_to_list(clean_mag),
+            }
         })
 
-    except Exception as exc:
+    except Exception as e:
         logger.exception("Enhancement failed")
-        return jsonify({"error": str(exc)}), 500
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
     load_model()
